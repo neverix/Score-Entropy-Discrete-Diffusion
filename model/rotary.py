@@ -40,6 +40,10 @@ def _apply_rotary_pos_emb_torchscript(qkv, cos, sin):
     return (qkv * cos) + (rotate_half(qkv) * sin)
 
 
+def _apply_rotary_pos_emb_plain(qkv, cos, sin):
+    return (qkv * cos) + (rotate_half(qkv) * sin)
+
+
 def apply_rotary_pos_emb(qkv, cos, sin):
     try:
         import flash_attn.layers.rotary
@@ -49,4 +53,7 @@ def apply_rotary_pos_emb(qkv, cos, sin):
             qkv, cos, sin
         )
     except:
-        return _apply_rotary_pos_emb_torchscript(qkv, cos, sin)
+        if qkv.device.type in ("cpu", "cuda"):
+            return _apply_rotary_pos_emb_torchscript(qkv, cos, sin)
+        else:
+            return _apply_rotary_pos_emb_plain(qkv, cos, sin)
