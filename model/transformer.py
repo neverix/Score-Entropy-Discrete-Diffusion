@@ -1,26 +1,34 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 import numpy as np
 import math
+from contextlib import nullcontext
+from functools import partial
 
 from einops import rearrange
-from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
+# from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
 # from flash_attn.ops.fused_dense import FusedMLP, FusedDense
 from huggingface_hub import PyTorchModelHubMixin
 from omegaconf import OmegaConf
 
 from . import rotary
 from .fused_add_dropout_scale import (
-    bias_dropout_add_scale_fused_train, 
-    bias_dropout_add_scale_fused_inference, 
-    get_bias_dropout_add_scale, 
+    bias_dropout_add_scale,
+    bias_dropout_add_scale_fused_train,
+    bias_dropout_add_scale_fused_inference,
+    get_bias_dropout_add_scale,
     modulate_fused,
 )
 
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+def modulate_plain(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
+    return x * (1 + scale) + shift
 
 
 
@@ -33,7 +41,8 @@ class LayerNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones([dim]))
         self.dim = dim
     def forward(self, x):
-        with torch.cuda.amp.autocast(enabled=False):
+        dt = x.device.type
+        with (torch.autocast(dt, enabled=False) if dt in ("cpu", "cuda") else nullcontext()):
             x = F.layer_norm(x.float(), [self.dim])
         return x * self.weight[None,None,:]
 
@@ -108,7 +117,7 @@ class LabelEmbedder(nn.Module):
     def forward(self, labels):
         embeddings = self.embedding_table(labels)
         return embeddings
-    
+
 
 #################################################################################
 #                                 Core Model                                    #
@@ -135,7 +144,7 @@ class DDiTBlock(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
 
         self.dropout = dropout
-        
+
 
         self.adaLN_modulation = nn.Linear(cond_dim, 6 * dim, bias=True)
         self.adaLN_modulation.weight.data.zero_()
@@ -143,11 +152,14 @@ class DDiTBlock(nn.Module):
 
 
     def _get_bias_dropout_scale(self):
-        return (
-            bias_dropout_add_scale_fused_train
-            if self.training
-            else bias_dropout_add_scale_fused_inference
-        )
+        if next(self.parameters()).device.type in ("cpu", "cuda"):
+            return (
+                bias_dropout_add_scale_fused_train
+                if self.training
+                else bias_dropout_add_scale_fused_inference
+            )
+        else:
+            return partial(bias_dropout_add_scale, training=self.training)
 
 
     def forward(self, x, rotary_cos_sin, c, seqlens=None):
@@ -159,33 +171,46 @@ class DDiTBlock(nn.Module):
 
         # attention operation
         x_skip = x
-        x = modulate_fused(self.norm1(x), shift_msa, scale_msa)
+        if x.device.type in ("cpu", "cuda"):
+            modulate_fn = modulate_fused
+        else:
+            modulate_fn = modulate_plain
+        x = modulate_fn(self.norm1(x), shift_msa, scale_msa)
         # dtype0 = x.dtype
 
         qkv = self.attn_qkv(x)
         qkv = rearrange(qkv, 'b s (three h d) -> b s three h d', three=3, h=self.n_heads)
-        with torch.cuda.amp.autocast(enabled=False):
+        dt = qkv.device.type
+        with (torch.autocast(dt, dtype=torch.float16, enabled=False) if dt in ("cpu", "cuda") else nullcontext()):
             cos, sin = rotary_cos_sin
             qkv = rotary.apply_rotary_pos_emb(
                 qkv, cos.to(qkv.dtype), sin.to(qkv.dtype)
             )
         qkv = rearrange(qkv, 'b s ... -> (b s) ...')
         if seqlens is None:
+            seqlens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=qkv.device)
             cu_seqlens = torch.arange(
                 0, (batch_size + 1) * seq_len, step=seq_len,
                 dtype=torch.int32, device=qkv.device
             )
         else:
             cu_seqlens = seqlens.cumsum(-1)
-        x = flash_attn_varlen_qkvpacked_func(
-            qkv, cu_seqlens, seq_len, 0., causal=False)
-        
-        x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
+        # x = flash_attn_varlen_qkvpacked_func(
+        #     qkv, cu_seqlens, seq_len, 0., causal=False)
+        q, k, v = rearrange(qkv, '(b s) three h d -> three b h s d', three=3, h=self.n_heads, b=batch_size)
+
+        mask = torch.arange(seq_len, dtype=torch.int32, device=qkv.device)[None, :] < seqlens[:, None]
+        mask = mask[:, :, None] * mask[:, None, :]
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask)
+
+        x = rearrange(x, 'b h s d -> b s (h d)', b=batch_size, s=seq_len, h=self.n_heads)
+        # x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
 
         x = bias_dropout_scale_fn(self.attn_out(x), None, gate_msa, x_skip, self.dropout)
 
         # mlp operation
-        x = bias_dropout_scale_fn(self.mlp(modulate_fused(self.norm2(x), shift_mlp, scale_mlp)), None, gate_mlp, x, self.dropout)
+        x = bias_dropout_scale_fn(self.mlp(modulate_fn(self.norm2(x), shift_mlp, scale_mlp)), None, gate_mlp, x, self.dropout)
         return x
 
 
@@ -193,7 +218,7 @@ class DDiTBlock(nn.Module):
 class EmbeddingLayer(nn.Module):
     def __init__(self, dim, vocab_dim):
         """
-        Mode arg: 0 -> use a learned layer, 1 -> use eigenvectors, 
+        Mode arg: 0 -> use a learned layer, 1 -> use eigenvectors,
         2-> add in eigenvectors, 3 -> use pretrained embedding matrix
         """
         super().__init__()
@@ -219,7 +244,10 @@ class DDitFinalLayer(nn.Module):
 
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
-        x = modulate_fused(self.norm_final(x), shift, scale)
+        if x.device.type in ("cpu", "cuda"):
+            x = modulate_fused(self.norm_final(x), shift, scale)
+        else:
+            x = modulate_plain(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
 
@@ -248,7 +276,7 @@ class SEDD(nn.Module, PyTorchModelHubMixin):
         self.output_layer = DDitFinalLayer(config.model.hidden_size, vocab_size, config.model.cond_dim)
         self.scale_by_sigma = config.model.scale_by_sigma
 
-    
+
     def _get_bias_dropout_scale(self):
         return (
             bias_dropout_add_scale_fused_train
@@ -264,7 +292,8 @@ class SEDD(nn.Module, PyTorchModelHubMixin):
 
         rotary_cos_sin = self.rotary_emb(x)
 
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        dt = indices.device.type
+        with (torch.autocast(dt, dtype=torch.float16, enabled=False) if dt in ("cpu", "cuda") else nullcontext()):
             for i in range(len(self.blocks)):
                 x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
 
@@ -275,7 +304,7 @@ class SEDD(nn.Module, PyTorchModelHubMixin):
             assert self.absorb, "Haven't configured this to work."
             esigm1_log = torch.where(sigma < 0.5, torch.expm1(sigma), sigma.exp() - 1).log().to(x.dtype)[:, None, None]
             x = x - esigm1_log - np.log(x.shape[-1] - 1)# this will be approximately averaged at 0
-            
+
         x = torch.scatter(x, -1, indices[..., None], torch.zeros_like(x[..., :1]))
 
         return x
