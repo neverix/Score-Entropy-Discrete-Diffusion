@@ -120,7 +120,9 @@ def get_sampling_fn(config, graph, noise, batch_dims, eps, device):
     return sampling_fn
 
 
-def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps=1e-5, device=torch.device('cpu'), proj_fun=lambda x: x):
+def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, truncate_steps=None, eps=1e-5, device=torch.device('cpu'), proj_fun=lambda x: x):
+    if truncate_steps is None:
+        truncate_steps = steps
     predictor = get_predictor(predictor)(graph, noise)
     projector = proj_fun
     denoiser = Denoiser(graph, noise)
@@ -130,9 +132,9 @@ def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps
         sampling_score_fn = mutils.get_score_fn(model, train=False, sampling=True)
         x = graph.sample_limit(*batch_dims).to(device)
         timesteps = torch.linspace(1, eps, steps + 1, device=device)
-        dt = (1 - eps) / steps
+        dt = (1 - eps) / max(steps, 1)
 
-        for i in trange(steps):
+        for i in trange(truncate_steps):
             t = timesteps[i] * torch.ones(x.shape[0], 1, device=device)
             x = projector(x)
             x = predictor.update_fn(sampling_score_fn, x, t, dt)

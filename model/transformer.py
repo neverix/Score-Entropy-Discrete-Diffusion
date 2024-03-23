@@ -201,8 +201,13 @@ class DDiTBlock(nn.Module):
 
         mask = torch.arange(seq_len, dtype=torch.int32, device=qkv.device)[None, :] < seqlens[:, None]
         mask = mask[:, :, None] * mask[:, None, :]
-        x = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask)
+        
+        # x = torch.nn.functional.scaled_dot_product_attention(
+        #     q, k, v, attn_mask=mask)
+        attn_logits = torch.einsum('b h i d, b h j d -> b h i j', q, k) / math.sqrt(q.shape[-1])
+        attn_logits = torch.where(mask[:, None, :, :], attn_logits, -1e10)
+        attn_patterns = F.softmax(attn_logits, dim=-1)
+        x = torch.einsum('b h i j, b h j d -> b h i d', attn_patterns, v)
 
         x = rearrange(x, 'b h s d -> b s (h d)', b=batch_size, s=seq_len, h=self.n_heads)
         # x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
@@ -211,7 +216,7 @@ class DDiTBlock(nn.Module):
 
         # mlp operation
         x = bias_dropout_scale_fn(self.mlp(modulate_fn(self.norm2(x), shift_mlp, scale_mlp)), None, gate_mlp, x, self.dropout)
-        return x
+        return x, attn_logits
 
 
 
@@ -296,6 +301,8 @@ class SEDD(nn.Module, PyTorchModelHubMixin):
         with (torch.autocast(dt, dtype=torch.float16, enabled=False) if dt in ("cpu", "cuda") else nullcontext()):
             for i in range(len(self.blocks)):
                 x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
+                if isinstance(x, tuple):
+                    x = x[0]
 
             x = self.output_layer(x, c)
 
