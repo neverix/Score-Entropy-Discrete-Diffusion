@@ -202,12 +202,12 @@ class DDiTBlock(nn.Module):
         mask = torch.arange(seq_len, dtype=torch.int32, device=qkv.device)[None, :] < seqlens[:, None]
         mask = mask[:, :, None] * mask[:, None, :]
         
-        # x = torch.nn.functional.scaled_dot_product_attention(
-        #     q, k, v, attn_mask=mask)
         attn_logits = torch.einsum('b h i d, b h j d -> b h i j', q, k) / math.sqrt(q.shape[-1])
         attn_logits = torch.where(mask[:, None, :, :], attn_logits, -1e10)
-        attn_patterns = F.softmax(attn_logits, dim=-1)
-        x = torch.einsum('b h i j, b h j d -> b h i d', attn_patterns, v)
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask[:, None])
+        # attn_patterns = F.softmax(attn_logits, dim=-1)
+        # x = torch.einsum('b h i j, b h j d -> b h i d', attn_patterns, v)
 
         x = rearrange(x, 'b h s d -> b s (h d)', b=batch_size, s=seq_len, h=self.n_heads)
         # x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
@@ -290,7 +290,7 @@ class SEDD(nn.Module, PyTorchModelHubMixin):
         )
 
 
-    def forward(self, indices, sigma):
+    def forward(self, indices, sigma, seqlens=None):
 
         x = self.vocab_embed(indices)
         c = F.silu(self.sigma_map(sigma))
@@ -300,7 +300,7 @@ class SEDD(nn.Module, PyTorchModelHubMixin):
         dt = indices.device.type
         with (torch.autocast(dt, dtype=torch.float16, enabled=False) if dt in ("cpu", "cuda") else nullcontext()):
             for i in range(len(self.blocks)):
-                x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
+                x = self.blocks[i](x, rotary_cos_sin, c, seqlens=seqlens)
                 if isinstance(x, tuple):
                     x = x[0]
 
