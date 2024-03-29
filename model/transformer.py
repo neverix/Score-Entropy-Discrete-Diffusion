@@ -124,6 +124,52 @@ class LabelEmbedder(nn.Module):
 #################################################################################
 
 
+class AttentionMixer(nn.Module):
+    def forward(self, v, attn_logits):
+        attn_patterns = F.softmax(attn_logits, dim=-1)
+        return torch.einsum('b h i j, b h j d -> b h i d', attn_patterns, v)
+
+
+class DDiTAttention(nn.Module):
+    def __init__(self, dim, n_heads):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.mixer = AttentionMixer()
+
+    def forward(self, qkv, rotary_cos_sin, seqlens=None):
+        batch_size, seq_len = qkv.shape[0], qkv.shape[1]
+        
+        dt = qkv.device.type
+        with (torch.autocast(dt, dtype=torch.float16, enabled=False) if dt in ("cpu", "cuda") else nullcontext()):
+            cos, sin = rotary_cos_sin
+            qkv = rotary.apply_rotary_pos_emb(
+                qkv, cos.to(qkv.dtype), sin.to(qkv.dtype)
+            )
+        qkv = rearrange(qkv, 'b s ... -> (b s) ...')
+        if seqlens is None:
+            seqlens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=qkv.device)
+            cu_seqlens = torch.arange(
+                0, (batch_size + 1) * seq_len, step=seq_len,
+                dtype=torch.int32, device=qkv.device
+            )
+        else:
+            cu_seqlens = seqlens.cumsum(-1)
+        # x = flash_attn_varlen_qkvpacked_func(
+        #     qkv, cu_seqlens, seq_len, 0., causal=False)
+        q, k, v = rearrange(qkv, '(b s) three h d -> three b h s d', three=3, h=self.n_heads, b=batch_size)
+
+        mask = torch.arange(seq_len, dtype=torch.int32, device=qkv.device)[None, :] < seqlens[:, None]
+        mask = mask[:, :, None] * mask[:, None, :]
+        
+        attn_logits = torch.einsum('b h i d, b h j d -> b h i j', q, k) / math.sqrt(q.shape[-1])
+        attn_logits = torch.where(mask[:, None, :, :], attn_logits, -1e10)
+        # x = torch.nn.functional.scaled_dot_product_attention(
+        #     q, k, v, attn_mask=mask[:, None])
+        x = self.mixer(v, attn_logits)
+        return x, attn_logits
+
+
 class DDiTBlock(nn.Module):
 
     def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1):
@@ -133,6 +179,7 @@ class DDiTBlock(nn.Module):
         self.norm1 = LayerNorm(dim)
         self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.attn_out = nn.Linear(dim, dim, bias=False)
+        self.attn = DDiTAttention(dim, n_heads)
         self.dropout1 = nn.Dropout(dropout)
 
         self.norm2 = LayerNorm(dim)
@@ -180,34 +227,7 @@ class DDiTBlock(nn.Module):
 
         qkv = self.attn_qkv(x)
         qkv = rearrange(qkv, 'b s (three h d) -> b s three h d', three=3, h=self.n_heads)
-        dt = qkv.device.type
-        with (torch.autocast(dt, dtype=torch.float16, enabled=False) if dt in ("cpu", "cuda") else nullcontext()):
-            cos, sin = rotary_cos_sin
-            qkv = rotary.apply_rotary_pos_emb(
-                qkv, cos.to(qkv.dtype), sin.to(qkv.dtype)
-            )
-        qkv = rearrange(qkv, 'b s ... -> (b s) ...')
-        if seqlens is None:
-            seqlens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=qkv.device)
-            cu_seqlens = torch.arange(
-                0, (batch_size + 1) * seq_len, step=seq_len,
-                dtype=torch.int32, device=qkv.device
-            )
-        else:
-            cu_seqlens = seqlens.cumsum(-1)
-        # x = flash_attn_varlen_qkvpacked_func(
-        #     qkv, cu_seqlens, seq_len, 0., causal=False)
-        q, k, v = rearrange(qkv, '(b s) three h d -> three b h s d', three=3, h=self.n_heads, b=batch_size)
-
-        mask = torch.arange(seq_len, dtype=torch.int32, device=qkv.device)[None, :] < seqlens[:, None]
-        mask = mask[:, :, None] * mask[:, None, :]
-        
-        attn_logits = torch.einsum('b h i d, b h j d -> b h i j', q, k) / math.sqrt(q.shape[-1])
-        attn_logits = torch.where(mask[:, None, :, :], attn_logits, -1e10)
-        x = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask[:, None])
-        # attn_patterns = F.softmax(attn_logits, dim=-1)
-        # x = torch.einsum('b h i j, b h j d -> b h i d', attn_patterns, v)
+        x, attn_logits = self.attn(qkv, rotary_cos_sin, seqlens=seqlens)
 
         x = rearrange(x, 'b h s d -> b s (h d)', b=batch_size, s=seq_len, h=self.n_heads)
         # x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
